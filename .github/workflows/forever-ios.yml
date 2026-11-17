@@ -1,0 +1,522 @@
+name: Slendytubbies FOREVER iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Download original FOREVER archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          page='https://garotopolvo.itch.io/slendytubbiesfrvr'
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          curl -fsSL --retry 2 --max-time 60 -c "$tmp/cookies" "$page" -o "$tmp/page.html"
+          csrf="$(python3 - "$tmp/page.html" <<'PY'
+          import re, sys
+          from pathlib import Path
+          match = re.search(r'<meta name="csrf_token" value="([^"]+)"', Path(sys.argv[1]).read_text())
+          if not match:
+              raise SystemExit("Could not read itch.io download page.")
+          print(match[1])
+          PY
+          )"
+
+          curl -fsS --max-time 60 -b "$tmp/cookies" -e "$page" \
+            -H 'X-Requested-With: XMLHttpRequest' \
+            -H 'Origin: https://garotopolvo.itch.io' \
+            --data-urlencode "csrf_token=$csrf" \
+            "$page/file/10321376?source=view_game&as_props=1" -o "$tmp/download.json"
+
+          url="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("url") or "")' < "$tmp/download.json")"
+          if [[ "$url" != https://* ]]; then
+            echo 'itch.io did not return a download link for the public FOREVER ZIP.'
+            exit 1
+          fi
+          curl -fsSL --proto '=https' --proto-redir '=https' --retry 1 --max-time 240 "$url" -o original.zip
+          unzip -tq original.zip
+
+      - name: Prepare the original game and three languages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > prepare.py <<'PYTHON'
+          from pathlib import Path, PurePosixPath
+          from shutil import copyfileobj
+          from sys import argv
+          from zipfile import ZipFile
+          import json
+
+          source, destination = Path(argv[1]), Path(argv[2])
+          destination.mkdir(parents=True, exist_ok=True)
+          with ZipFile(source) as archive:
+              entries = {PurePosixPath(name): name for name in archive.namelist() if not name.endswith("/")}
+              roots = [path.parent for path in entries if path.name == "index.html" and
+                       path.parent / "data.json" in entries and
+                       path.parent / "scripts" / "c3runtime.js" in entries]
+              if len(roots) != 1:
+                  raise SystemExit("Expected one Construct export in the original FOREVER ZIP.")
+              for path, name in entries.items():
+                  if not path.is_relative_to(roots[0]):
+                      continue
+                  relative = path.relative_to(roots[0])
+                  if ".." in relative.parts or "\\" in relative.as_posix():
+                      raise SystemExit("Invalid path in the game archive.")
+                  if relative.as_posix() not in {"index.html", "style.css", "data.json"} and relative.parts[0] not in {"fonts", "icons", "images", "media", "scripts"}:
+                      continue
+                  output = destination / relative
+                  output.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(name) as game_file, output.open("wb") as extracted:
+                      copyfileobj(game_file, extracted)
+
+          data_path = destination / "data.json"
+          original_data = json.loads(data_path.read_text(encoding="utf-8"))
+          project = original_data["project"]
+          if project[:2] != ["slendytubbies frvr", "main menu"]:
+              raise SystemExit("The archive does not match the FOREVER open beta this build supports.")
+          translations = {
+              "campaing": ("Campaign", "Кампания", "Кампанія"),
+              "sandbox": ("Sandbox", "Песочница", "Пісочниця"),
+              "multiplayer": ("Multiplayer", "Мультиплеер", "Мультиплеєр"),
+              "exit": ("Exit", "Выход", "Вихід"),
+              "by": ("by", "Автор", "Автор"),
+              "collect the all cream custards and RUN FROM TINKY WINKY BEFORE HE CATCHES YOU": (
+                  "Collect all the custards and run from Tinky Winky before he catches you!",
+                  "Собери все пудинги и убегай от Тинки-Винки!",
+                  "Збери всі пудинги й тікай від Тінкі-Вінкі!",
+              ),
+              "You have 3 chances to try to say something about what he is doing . . .": (
+                  "You have three chances to talk to him about what he's doing…",
+                  "У тебя три попытки поговорить с ним о том, что он делает…",
+                  "У тебе три спроби поговорити з ним про те, що він робить…",
+              ),
+              "Why isn't it covered in blood?": (
+                  "Why isn't it covered in blood?", "Почему на этом нет крови?", "Чому на цьому немає крові?",
+              ),
+              "why are you doing this": ("Why are you doing this?", "Зачем ты это делаешь?", "Навіщо ти це робиш?"),
+              "skibidi toilet or creeper": ("Skibidi Toilet or Creeper?", "Скибиди-туалет или крипер?", "Скібіді-туалет чи кріпер?"),
+              "what made you do this": ("What made you do this?", "Что заставило тебя это сделать?", "Що змусило тебе це зробити?"),
+              "RUN TO YOU STILL CAAN  TO CAVE!": ("Run to the cave while you still can!", "Беги в пещеру, пока ещё можешь!", "Біжи до печери, поки ще можеш!"),
+          }
+
+          def translate(nodes, index, found):
+              if not isinstance(nodes, list):
+                  return
+              if len(nodes) > 3 and isinstance(nodes[0], str) and nodes[0] in translations and nodes[2] == "VCR_OSD_MONO_1.001":
+                  found.add(nodes[0])
+                  nodes[0] = translations[nodes[0]][index]
+                  if index:
+                      nodes[2] = "Arial"
+                  return
+              for node in nodes:
+                  translate(node, index, found)
+
+          for index, language in enumerate(("en", "ru", "uk")):
+              data = json.loads(data_path.read_text(encoding="utf-8"))
+              found = set()
+              translate(data["project"][5], index, found)
+              if found != translations.keys():
+                  raise SystemExit(f"Missing game strings for {language}: {sorted(translations.keys() - found)}")
+              (destination / f"data.{language}.json").write_text(
+                  json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+              )
+          data_path.unlink()
+
+          def patch(path, replacements):
+              content = path.read_text(encoding="utf-8")
+              for before, after in replacements:
+                  if content.count(before) != 1:
+                      raise SystemExit(f"Unexpected FOREVER export: {path.name} has no unique target {before!r}")
+                  content = content.replace(before, after, 1)
+              path.write_text(content, encoding="utf-8")
+
+          patch(destination / "scripts" / "main.js", [
+              ('const enableWorker=false;', 'const enableWorker=false;runOnStartup(window.foreverAttach);'),
+              ('exportType:"nwjs"', 'exportType:"html5"'),
+              ('this._iRuntime.GetMainCanvas().requestPointerLock()', 'window.foreverTouch || this._iRuntime.GetMainCanvas().requestPointerLock?.()?.catch?.(() => {})'),
+              ('document.exitPointerLock()', 'document.exitPointerLock?.()'),
+          ])
+          patch(destination / "scripts" / "c3runtime.js", [
+              ('FetchJson("data.json")', 'FetchJson("data."+self.foreverLanguage+".json")'),
+          ])
+          patch(destination / "index.html", [
+              ('width=device-width,', 'width=device-width, viewport-fit=cover,'),
+              ('<script src="scripts/main.js"', '<script src="mobile.js"></script>\n\t<script src="scripts/main.js"'),
+          ])
+          (destination / "mobile.js").write_bytes(Path(__file__).with_name("mobile.js").read_bytes())
+          print(f"Prepared {len(list(destination.rglob('*')))} paths and verified 12 game strings in each of en, ru and uk.")
+          PYTHON
+          cat > mobile.js <<'JAVASCRIPT'
+          "use strict";
+
+          const labels = {
+              en: ["Language", "Run", "Sandbox controls", "Loading…", "The game did not finish loading."],
+              ru: ["Язык", "Бег", "Кнопки песочницы", "Загрузка…", "Игра не завершила загрузку."],
+              uk: ["Мова", "Біг", "Кнопки пісочниці", "Завантаження…", "Гра не завершила завантаження."],
+          };
+          const requested = new URLSearchParams(location.search).get("lang");
+          const language = Object.hasOwn(labels, requested) ? requested : "en";
+          window.foreverLanguage = language;
+          window.foreverTouch = navigator.maxTouchPoints > 0;
+          document.documentElement.lang = language;
+
+          const style = document.createElement("style");
+          style.textContent = `
+              body { touch-action: none; overscroll-behavior: none; background-color: black; }
+              #forever-ui { position: fixed; inset: 0; z-index: 10000; pointer-events: none;
+                  color: white; font: 15px system-ui; -webkit-user-select: none; user-select: none; }
+              #forever-ui button, #forever-ui select, #forever-ui summary {
+                  pointer-events: auto; background: #171717ce; color: white; border: 1px solid #ffffff75;
+                  border-radius: 8px; font: inherit; padding: 8px; min-width: 44px; min-height: 44px;
+                  box-sizing: border-box; touch-action: none; }
+              #forever-ui button[data-held] { background: #666; }
+              #forever-ui [hidden] { display: none !important; }
+              #forever-language { position: absolute; top: max(8px, env(safe-area-inset-top));
+                  right: max(12px, env(safe-area-inset-right)); }
+              #forever-pad { position: absolute; left: max(12px, env(safe-area-inset-left));
+                  bottom: max(12px, env(safe-area-inset-bottom)); display: grid;
+                  grid-template-columns: repeat(3, 1fr); gap: 4px; }
+              #forever-pad button:first-child { grid-column: 2; }
+              #forever-pad button:nth-child(2) { grid-column: 1; }
+              #forever-run { position: absolute; right: max(12px, env(safe-area-inset-right));
+                  bottom: max(14px, env(safe-area-inset-bottom)); }
+              #forever-extra { position: absolute; top: max(8px, env(safe-area-inset-top));
+                  left: max(12px, env(safe-area-inset-left)); }
+              #forever-extra summary { width: fit-content; }
+              #forever-extra div { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; margin-top: 4px; }
+              #forever-status { position: absolute; left: 24px; bottom: 18px; margin: 0;
+                  color: white; background: #171717db; padding: 8px; border-radius: 6px; }
+          `;
+          document.head.append(style);
+
+          const ui = document.createElement("div");
+          ui.id = "forever-ui";
+          document.body.append(ui);
+          const localized = labels[language];
+
+          const selector = document.createElement("select");
+          selector.id = "forever-language";
+          selector.setAttribute("aria-label", localized[0]);
+          for (const [code, name] of [["en","English"], ["ru","Русский"], ["uk","Українська"]]) {
+              selector.add(new Option(name, code, false, code === language));
+          }
+          selector.addEventListener("change", () => {
+              window.webkit?.messageHandlers?.foreverLanguage?.postMessage(selector.value);
+              const nextPage = new URL(location.href);
+              nextPage.searchParams.set("lang", selector.value);
+              location.replace(nextPage.href);
+          });
+          ui.append(selector);
+
+          const status = document.createElement("p");
+          status.id = "forever-status";
+          status.textContent = localized[3];
+          ui.append(status);
+          const startupTimer = setTimeout(() => { status.textContent = localized[4]; }, 25000);
+
+          const pad = document.createElement("div");
+          pad.id = "forever-pad";
+          pad.hidden = true;
+          ui.append(pad);
+          const held = new Map();
+
+          function sendKey(type, code, key, numeric) {
+              const event = new KeyboardEvent(type, { code, key, shiftKey: code === "ShiftLeft" && type === "keydown" });
+              Object.defineProperty(event, "which", { value: numeric });
+              window.dispatchEvent(event);
+          }
+
+          function addButton(parent, title, code, key, numeric) {
+              const button = document.createElement("button");
+              button.type = "button";
+              button.textContent = title;
+              for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"]) {
+                  button.addEventListener(eventName, event => release(event.pointerId));
+              }
+              button.addEventListener("pointerdown", event => {
+                  if (held.has(event.pointerId)) return;
+                  event.preventDefault();
+                  button.setPointerCapture(event.pointerId);
+                  held.set(event.pointerId, { button, code, key, numeric });
+                  button.dataset.held = "";
+                  sendKey("keydown", code, key, numeric);
+              });
+              parent.append(button);
+              return button;
+          }
+
+          function release(pointerId) {
+              const state = held.get(pointerId);
+              if (!state) return;
+              held.delete(pointerId);
+              delete state.button.dataset.held;
+              sendKey("keyup", state.code, state.key, state.numeric);
+          }
+
+          for (const [i, title] of ["▲", "◀", "▼", "▶"].entries()) {
+              const letter = "WASD"[i];
+              addButton(pad, title, "Key" + letter, letter.toLowerCase(), letter.charCodeAt(0));
+          }
+          const run = addButton(ui, localized[1], "ShiftLeft", "Shift", 16);
+          run.id = "forever-run";
+          run.hidden = true;
+
+          const extras = document.createElement("details");
+          extras.id = "forever-extra";
+          extras.hidden = true;
+          const summary = document.createElement("summary");
+          summary.textContent = localized[2];
+          const extraButtons = document.createElement("div");
+          extras.append(summary, extraButtons);
+          ui.append(extras);
+          for (const digit of "1234567890") addButton(extraButtons, digit, "Digit" + digit, digit, digit.charCodeAt(0));
+          for (const letter of "QEKL") addButton(extraButtons, letter, "Key" + letter, letter.toLowerCase(), letter.charCodeAt(0));
+          addButton(extraButtons, "−", "Minus", "-", 189);
+          addButton(extraButtons, "Esc", "Escape", "Escape", 27);
+
+          let layoutName = "";
+          let finger;
+          const movementLayouts = new Set(["Layout 1", "Layout 6", "Layout 9"]);
+
+          function releaseControls() {
+              for (const id of held.keys()) release(id);
+              finger = undefined;
+          }
+
+          window.addEventListener("blur", releaseControls);
+          document.addEventListener("visibilitychange", () => {
+              if (document.hidden) releaseControls();
+          });
+
+          function mouse(type, original, movementX = 0, movementY = 0) {
+              const options = {
+                  bubbles: true, pointerType: "mouse", pointerId: 1, button: 0,
+                  buttons: type === "pointerdown" ? 1 : 0,
+                  clientX: original.clientX, clientY: original.clientY,
+              };
+              const event = new PointerEvent(type, options);
+              Object.defineProperties(event, { movementX: { value: movementX }, movementY: { value: movementY } });
+              original.target.dispatchEvent(event);
+          }
+          window.addEventListener("pointerdown", event => {
+              if (event.pointerType !== "touch" || event.target.tagName !== "CANVAS" || finger) return;
+              finger = { id: event.pointerId, x: event.clientX, y: event.clientY };
+              if (movementLayouts.has(layoutName)) event.target.setPointerCapture(event.pointerId);
+          }, true);
+          window.addEventListener("pointermove", event => {
+              if (event.pointerType !== "touch" || finger?.id !== event.pointerId || !movementLayouts.has(layoutName)) return;
+              const dx = event.clientX - finger.x;
+              const dy = event.clientY - finger.y;
+              finger.x = event.clientX;
+              finger.y = event.clientY;
+              mouse("pointermove", event, dx, dy);
+          }, true);
+          window.addEventListener("pointerup", event => {
+              if (event.pointerType !== "touch" || finger?.id !== event.pointerId) return;
+              finger = undefined;
+              if (!movementLayouts.has(layoutName)) {
+                  mouse("pointermove", event);
+                  mouse("pointerdown", event);
+                  mouse("pointerup", event);
+              }
+          }, true);
+          window.addEventListener("pointercancel", event => {
+              if (event.pointerType === "touch" && finger?.id === event.pointerId) finger = undefined;
+          }, true);
+
+          window.foreverAttach = runtime => {
+              runtime.addEventListener("tick", () => {
+                  const name = runtime.layout.name;
+                  if (layoutName === name) return;
+                  layoutName = name;
+                  clearTimeout(startupTimer);
+                  status.hidden = true;
+                  releaseControls();
+                  pad.hidden = run.hidden = !window.foreverTouch || !movementLayouts.has(name);
+                  extras.hidden = !window.foreverTouch || name !== "Layout 9";
+                  if (extras.hidden) extras.open = false;
+                  selector.hidden = name !== "main menu";
+              });
+          };
+          JAVASCRIPT
+          app="$RUNNER_TEMP/forever/Payload/Forever.app"
+          mkdir -p "$app/Web"
+          python3 prepare.py original.zip "$app/Web"
+          node --check "$app/Web/mobile.js"
+
+      - name: Compile and package the arm64 IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > Host.m <<'OBJECTIVEC'
+          #import <UIKit/UIKit.h>
+          #import <WebKit/WebKit.h>
+          #include <arpa/inet.h>
+          #include <errno.h>
+          #include <netinet/in.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/socket.h>
+          #include <sys/time.h>
+          #include <unistd.h>
+
+          static BOOL WriteBytes(int client, const void *bytes, size_t length) {
+              const char *position = bytes;
+              while (length) {
+                  ssize_t written = send(client, position, length, 0);
+                  if (written < 0 && errno == EINTR) continue;
+                  if (written <= 0) return NO;
+                  position += written;
+                  length -= (size_t)written;
+              }
+              return YES;
+          }
+
+          static void SendHeaders(int client, NSString *status, NSString *fields) {
+              NSString *headers = [NSString stringWithFormat:@"HTTP/1.1 %@\r\nConnection: close\r\n%@\r\n", status, fields];
+              NSData *data = [headers dataUsingEncoding:NSUTF8StringEncoding];
+              WriteBytes(client, data.bytes, data.length);
+          }
+
+          static BOOL ReadRange(NSString *range, unsigned long long length, unsigned long long *start, unsigned long long *end) {
+              if (![range hasPrefix:@"bytes="] || !length) return NO;
+              NSArray<NSString *> *bounds = [[range substringFromIndex:6] componentsSeparatedByString:@"-"];
+              if (bounds.count != 2) return NO;
+              NSString *first = bounds[0], *last = bounds[1];
+              NSCharacterSet *invalidDigits = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+              if ((!first.length && !last.length) ||
+                  [first rangeOfCharacterFromSet:invalidDigits].location != NSNotFound ||
+                  [last rangeOfCharacterFromSet:invalidDigits].location != NSNotFound) return NO;
+              if (!first.length) {
+                  unsigned long long suffix = strtoull(last.UTF8String, NULL, 10);
+                  if (!suffix) return NO;
+                  *start = length - MIN(length, suffix);
+                  return YES;
+              }
+              *start = strtoull(first.UTF8String, NULL, 10);
+              if (last.length) *end = MIN(*end, strtoull(last.UTF8String, NULL, 10));
+              return *start < length && *start <= *end;
+          }
+
+          static void ServeFile(int client, NSString *root) {
+              NSMutableData *request = [NSMutableData data];
+              NSString *headers = nil;
+              while (request.length < 16384) {
+                  char buffer[4096];
+                  ssize_t count = recv(client, buffer, sizeof(buffer), 0);
+                  if (count < 0 && errno == EINTR) continue;
+                  if (count <= 0) return;
+                  [request appendBytes:buffer length:(NSUInteger)count];
+                  NSString *text = [[NSString alloc] initWithData:request encoding:NSISOLatin1StringEncoding];
+                  NSRange separator = [text rangeOfString:@"\r\n\r\n"];
+                  if (separator.location != NSNotFound) {
+                      headers = [text substringToIndex:separator.location];
+                      break;
+                  }
+              }
+              if (!headers) return;
+              NSArray<NSString *> *lines = [headers componentsSeparatedByString:@"\r\n"];
+              NSArray<NSString *> *requestLine = [lines[0] componentsSeparatedByString:@" "];
+              if (requestLine.count != 3) return;
+              BOOL head = [requestLine[0] isEqualToString:@"HEAD"];
+              if (!head && ![requestLine[0] isEqualToString:@"GET"]) {
+                  SendHeaders(client, @"405 Method Not Allowed", @"Content-Length: 0\r\n");
+                  return;
+              }
+              NSString *urlPath = [[requestLine[1] componentsSeparatedByString:@"?"][0] stringByRemovingPercentEncoding];
+              NSArray<NSString *> *segments = [urlPath componentsSeparatedByString:@"/"];
+              if (![urlPath hasPrefix:@"/"] || [segments containsObject:@".."]) {
+                  SendHeaders(client, @"400 Bad Request", @"Content-Length: 0\r\n");
+                  return;
+              }
+              if ([urlPath isEqualToString:@"/"]) urlPath = @"/index.html";
+              NSString *path = [root stringByAppendingPathComponent:[urlPath substringFromIndex:1]];
+              NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+              if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
+                  SendHeaders(client, @"404 Not Found", @"Content-Length: 0\r\n");
+                  return;
+              }
+              NSFileHandle *file = head ? nil : [NSFileHandle fileHandleForReadingAtPath:path];
+              if (!head && !file) {
+                  SendHeaders(client, @"404 Not Found", @"Content-Length: 0\r\n");
+                  return;
+              }
+
+              NSDictionary<NSString *, NSString *> *types = @{
+                  @"html": @"text/html; charset=utf-8", @"js": @"text/javascript; charset=utf-8",
+                  @"css": @"text/css; charset=utf-8", @"json": @"application/json",
+                  @"png": @"image/png", @"jpg": @"image/jpeg", @"webp": @"image/webp",
+                  @"webm": @"video/webm", @"mp4": @"video/mp4", @"ogg": @"audio/ogg",
+                  @"ttf": @"font/ttf", @"woff": @"font/woff", @"woff2": @"font/woff2",
+                  @"wasm": @"application/wasm",
+              };
+              NSString *mime = types[path.pathExtension.lowercaseString] ?: @"application/octet-stream";
+              if ([path.pathExtension.lowercaseString isEqualToString:@"webm"] &&
+                  ![@[@"0409", @"0410(2)", @"0414", @"0423", @"0425", @"sus"] containsObject:path.lastPathComponent.stringByDeletingPathExtension]) {
+                  mime = @"audio/webm";
+              }
+
+              unsigned long long length = [attributes[NSFileSize] unsignedLongLongValue];
+              unsigned long long start = 0, end = length ? length - 1 : 0;
+              NSString *range = nil;
+              for (NSString *line in lines) {
+                  if ([line.lowercaseString hasPrefix:@"range:"]) {
+                      range = [[line substringFromIndex:6] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                      break;
+                  }
+              }
+              if (range && !ReadRange(range, length, &start, &end)) {
+                  SendHeaders(client, @"416 Range Not Satisfiable", [NSString stringWithFormat:@"Content-Range: bytes */%llu\r\nContent-Length: 0\r\n", length]);
+                  [file closeFile];
+                  return;
+              }
+
+              unsigned long long remaining = length ? end - start + 1 : 0;
+              NSMutableString *fields = [NSMutableString stringWithFormat:@"Content-Type: %@\r\nContent-Length: %llu\r\nAccept-Ranges: bytes\r\n", mime, remaining];
+              if (range) [fields appendFormat:@"Content-Range: bytes %llu-%llu/%llu\r\n", start, end, length];
+              SendHeaders(client, range ? @"206 Partial Content" : @"200 OK", fields);
+              if (head) return;
+              [file seekToFileOffset:start];
+              while (remaining) {
+                  @autoreleasepool {
+                      NSData *chunk = [file readDataOfLength:(NSUInteger)MIN(remaining, 128 * 1024ULL)];
+                      if (!chunk.length || !WriteBytes(client, chunk.bytes, chunk.length)) break;
+                      remaining -= chunk.length;
+                  }
+              }
+              [file closeFile];
+          }
+
+          static uint16_t StartServer(NSString *root) {
+              int server = socket(AF_INET, SOCK_STREAM, 0);
+              if (server < 0) return 0;
+              struct sockaddr_in address = {0};
+              address.sin_len = sizeof(address);
+              address.sin_family = AF_INET;
+              address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+              socklen_t length = sizeof(address);
+              if (bind(server, (struct sockaddr *)&address, length) < 0 ||
+                  listen(server, 32) < 0 ||
+                  getsockname(server, (struct sockaddr *)&address, &length) < 0) {
+                  close(server);
+                  return 0;
+              }
+              dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                  for (;;) {
+                      int client = accept(server, NULL, NULL);
+                      if (client < 0 && errno == EINTR) continue;
+                      if (client < 0) break;
+                      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                          @autoreleasepool {
+                              int enabled = 1;
+                              struct timeval timeout = {10, 0};
+                              setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+                              setsockopt(client, SOL_SOCKET, SO_RCV
