@@ -349,7 +349,10 @@ jobs:
           JAVASCRIPT
           app="$RUNNER_TEMP/forever/Payload/Forever.app"
           mkdir -p "$app/Web"
-          python3 prepare.py original.zip "$app/      - name: Compile and package the arm64 IPA
+          python3 prepare.py original.zip "$app/Web"
+          node --check "$app/Web/mobile.js"
+
+      - name: Compile and package the arm64 IPA
         shell: bash
         run: |
           set -euo pipefail
@@ -665,4 +668,4 @@ jobs:
         with:
           name: Slendytubbies-FOREVER-iOS
           path: Slendytubbies-FOREVER.ipa
-          if-no-files-found: error   node --check "$app/Web/mobile.js"x
+          if-no-files-found: error
