@@ -349,10 +349,7 @@ jobs:
           JAVASCRIPT
           app="$RUNNER_TEMP/forever/Payload/Forever.app"
           mkdir -p "$app/Web"
-          python3 prepare.py original.zip "$app/Web"
-          node --check "$app/Web/mobile.js"
-
-      - name: Compile and package the arm64 IPA
+          python3 prepare.py original.zip "$app/      - name: Compile and package the arm64 IPA
         shell: bash
         run: |
           set -euo pipefail
@@ -519,4 +516,153 @@ jobs:
                               int enabled = 1;
                               struct timeval timeout = {10, 0};
                               setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
-                              setsockopt(client, SOL_SOCKET, SO_RCV
+                              setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                              setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+                              @try {
+                                  ServeFile(client, root);
+                              } @catch (NSException *exception) {
+                                  NSLog(@"FOREVER local server: %@", exception);
+                              } @finally {
+                                  close(client);
+                              }
+                          }
+                      });
+                  }
+                  close(server);
+              });
+              return ntohs(address.sin_port);
+          }
+
+          @interface GameController : UIViewController <WKScriptMessageHandler, WKNavigationDelegate>
+          @property(nonatomic, strong) WKWebView *webView;
+          @property(nonatomic, strong) NSURL *gameURL;
+          @end
+
+          @implementation GameController
+          - (BOOL)prefersStatusBarHidden { return YES; }
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.view.backgroundColor = UIColor.blackColor;
+              NSString *root = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"Web"];
+              uint16_t port = StartServer(root);
+              if (!port) {
+                  [self showError:@"Could not open the local game server."];
+                  return;
+              }
+              WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+              configuration.allowsInlineMediaPlayback = YES;
+              configuration.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
+              [configuration.userContentController addScriptMessageHandler:self name:@"foreverLanguage"];
+              self.webView = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:configuration];
+              self.webView.opaque = NO;
+              self.webView.backgroundColor = UIColor.blackColor;
+              self.webView.scrollView.scrollEnabled = NO;
+              self.webView.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+              self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              self.webView.navigationDelegate = self;
+              [self.view addSubview:self.webView];
+
+              NSString *language = [NSUserDefaults.standardUserDefaults stringForKey:@"foreverLanguage"] ?: @"en";
+              self.gameURL = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%u/index.html?lang=%@", (unsigned)port, language]];
+              [self.webView loadRequest:[NSURLRequest requestWithURL:self.gameURL]];
+          }
+
+          - (void)showError:(NSString *)message {
+              UILabel *label = [[UILabel alloc] initWithFrame:CGRectInset(self.view.bounds, 30, 20)];
+              label.textColor = UIColor.whiteColor;
+              label.textAlignment = NSTextAlignmentCenter;
+              label.numberOfLines = 0;
+              label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              label.text = message;
+              [self.view addSubview:label];
+          }
+
+          - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
+              if ([@[@"en", @"ru", @"uk"] containsObject:message.body]) {
+                  [NSUserDefaults.standardUserDefaults setObject:message.body forKey:@"foreverLanguage"];
+              }
+          }
+
+          - (void)webView:(WKWebView *)view didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+              if (error.code != NSURLErrorCancelled) [self showError:error.localizedDescription];
+          }
+
+          - (void)webViewWebContentProcessDidTerminate:(WKWebView *)view {
+              [self showError:@"The game stopped. Close and reopen FOREVER to retry."];
+          }
+
+          - (void)webView:(WKWebView *)view decidePolicyForNavigationAction:(WKNavigationAction *)action
+          decisionHandler:(void (^)(WKNavigationActionPolicy))handler {
+              NSURL *url = action.request.URL;
+              BOOL isLocal = [url.scheme isEqualToString:@"http"] && [url.host isEqualToString:@"127.0.0.1"] &&
+                             [url.port isEqual:self.gameURL.port];
+              handler(isLocal ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
+          }
+          @end
+
+          @interface ForeverApp : UIResponder <UIApplicationDelegate>
+          @property(nonatomic, strong) UIWindow *window;
+          @end
+
+          @implementation ForeverApp
+          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options {
+              self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              self.window.rootViewController = [[GameController alloc] init];
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+          @end
+
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil, NSStringFromClass(ForeverApp.class));
+              }
+          }
+          OBJECTIVEC
+          out="$RUNNER_TEMP/forever"
+          app="$out/Payload/Forever.app"
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios17.4 -isysroot "$sdk" -fobjc-arc -O2 \
+            -framework Foundation -framework UIKit -framework WebKit \
+            Host.m -o "$app/Forever"
+          lipo -verify_arch arm64 "$app/Forever"
+
+          cat > "$app/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>Forever</string>
+            <key>CFBundleIdentifier</key><string>com.slendytubbies.forever.fanport</string>
+            <key>CFBundleDisplayName</key><string>Slendytubbies FOREVER</string>
+            <key>CFBundleName</key><string>Forever</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>${{ github.run_number }}</string>
+            <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>MinimumOSVersion</key><string>17.4</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>UISupportedInterfaceOrientations</key>
+            <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+            <key>UIRequiresFullScreen</key><true/>
+            <key>UIStatusBarHidden</key><true/>
+            <key>UILaunchScreen</key><dict/>
+            <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+          </dict>
+          </plist>
+          PLIST
+
+          plutil -lint "$app/Info.plist"
+          ditto -c -k --keepParent "$out/Payload" "$GITHUB_WORKSPACE/Slendytubbies-FOREVER.ipa"
+          unzip -tq "$GITHUB_WORKSPACE/Slendytubbies-FOREVER.ipa"
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendytubbies-FOREVER-iOS
+          path: Slendytubbies-FOREVER.ipa
+          if-no-files-found: error   node --check "$app/Web/mobile.js"x
